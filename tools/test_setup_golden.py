@@ -64,18 +64,19 @@ def normalize(v, t: Path):
     return v
 
 
-def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
+def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=(), version="0.1.32"):
     """setup.main() on a mocked PC -> (exit code, printed text, the written config or None, the questions asked).
     answers: None = --yes (a question fails the run), "" = Enter for every question, a list of answers in order, or
     {words of a question: its answer} (Enter for the others).
-    extra: more patches (mock.patch objects).  configs: (name, dict) run configs already in the Strata folder."""
+    extra: more patches (mock.patch objects).  configs: (name, dict) run configs already in the Strata folder.
+    version: the installed engine's version (BUILD.json)."""
     with tempfile.TemporaryDirectory() as tmp:
         t = Path(tmp)
         (t / "data" / "mtp" / "rt").mkdir(parents=True)
         (t / "data" / "mtp" / "rt" / "experts.bin").write_bytes(b"")
         eng = t / "engine"
         eng.mkdir()
-        (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.32", "source": "local", "cuda_dirs": ["<cuda>"]}))
+        (eng / "BUILD.json").write_text(json.dumps({"version": version, "source": "local", "cuda_dirs": ["<cuda>"]}))
         for name, c in configs:
             (t / name).write_text(json.dumps(c))
         asked = []

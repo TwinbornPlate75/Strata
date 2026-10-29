@@ -620,7 +620,8 @@ struct Options {
     bool resident_cpu_explicit = false;   ///< #384: --resident-cpu-experts given by itself (not only implied)
     /// CS-T `--resident-budget-gib N`: the resident mode with a RAM budget - the N GiB of experts the GPU cache does
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
-    /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
+    /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts);
+    /// `kResidentWhatFits` ("auto") = as much as the RAM available at start can hold (soft mode, #467).
     uint64_t resident_budget = 0;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
@@ -1146,6 +1147,10 @@ void usage() {
                  "  --resident-experts   the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
                  "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
+                 "  --resident-budget-gib N|auto  the same copy, holding only N GiB of the experts the GPU cache does\n"
+                 "                       not hold - the hottest by --expert-profile first - and reading the rest from the\n"
+                 "                       files.  auto: the GiB the RAM has free at start (available less the headroom), so\n"
+                 "                       a PC that cannot hold every expert still keeps as many as it can instead of none.\n"
                  "  --adapt-min-gain F   the adaptive tier swaps an expert in only when its decayed routing count beats\n"
                  "                       the one it replaces by more than F (default 1.5; higher = fewer, surer swaps)\n"
                  "  --adapt-async 0|1    --serve with the resident RAM mode or the arena (one GPU): the adaptive\n"
@@ -3305,9 +3310,19 @@ int main(int argc, char** argv) {
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
         }
         else if (a == "--resident-budget-gib") {
-            const double gib = std::atof(next("--resident-budget-gib"));
-            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0\n"); return 2; }
-            o.resident_budget = (uint64_t) (gib * 1073741824.0);
+            // "auto": the budget the RAM can really hold at start (available less the headroom, the hottest experts by
+            // the profile first) - `kResidentWhatFits`, the same value --resident-experts' soft retry passes (#467).
+            // A PC whose RAM holds no part of the experts that are outside the GPU cache would otherwise keep none of
+            // them and read every miss from the SSD.
+            const std::string budget_arg = next("--resident-budget-gib");
+            const bool auto_budget = budget_arg == "auto";
+            const double gib = auto_budget ? 0.0 : std::atof(budget_arg.c_str());
+            if (!auto_budget && !(gib > 0.0)) {
+                std::fprintf(stderr, "strata generate: --resident-budget-gib needs N > 0, or auto\n");
+                return 2;
+            }
+            o.resident_budget = auto_budget ? strata::core::FileExpertSource::kResidentWhatFits
+                                            : (uint64_t) (gib * 1073741824.0);
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = true;
             o.resident_headroom = 4ull << 30;
             if (const char* v = std::getenv("STRATA_RESIDENT_PIN"); v != nullptr && std::string(v) == "0")
@@ -9126,15 +9141,24 @@ int main(int argc, char** argv) {
         // #1683: with a RAM budget the lend region is kept after the ranked experts, as far as the budget reaches, so
         // the advice there is a larger budget, not a smaller chunk (the budget used to keep none of it whatever the chunk)
         if (resident_ok && lend_from >= 0 && (o.prefill_chunk > 8192 || o.resident_budget > 0) && xcache.slots() > lend_from &&
-            src.resident_lent_slots() < xcache.slots() - lend_from)
-            std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
-                                 "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
-                                 "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
-                                 "%s keeps them all in RAM\n",
-                         (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
-                         (long long) src.resident_lent_slots(),
-                         o.resident_budget > 0 ? "A larger --resident-budget-gib (the lend region comes after the ranked experts), or a smaller --prefill,"
-                                               : "A smaller --prefill, or auto,");
+            src.resident_lent_slots() < xcache.slots() - lend_from) {
+            if (o.resident_budget == strata::core::FileExpertSource::kResidentWhatFits)
+                // --resident-budget-gib auto already holds every GiB the RAM had: the lend region comes after the ranked
+                // experts and there is nothing left for it, and no budget to raise - the warning below would promise a fix
+                // the user cannot make (a smaller chunk does not free RAM either: the copy is the RAM).  Said plainly.
+                std::fprintf(stderr, "strata generate: a %lld-token prompt chunk lends %lld cache slots to the prompt path, "
+                                     "and the RAM copy is as large as the RAM allows: their experts are read from the model "
+                                     "folder, so a long prompt reads from the SSD where a short one does not\n",
+                             (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from));
+            else
+                std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
+                                     "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
+                                     "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
+                                     "A larger --resident-budget-gib (the lend region comes after the ranked experts), or a "
+                                     "smaller --prefill, keeps them all in RAM\n",
+                             (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
+                             (long long) src.resident_lent_slots());
+        }
         if (resident_ok) {
             // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
             // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
@@ -9161,6 +9185,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: WARNING: the resident RAM mode does not fit (%s); the experts the "
                                  "GPU does not hold are read from the model folder through the OS file cache "
                                  "(--mmap-experts), which is slower when the RAM cannot keep them\n", err.c_str());
+        } else if (o.resident_budget == strata::core::FileExpertSource::kResidentWhatFits) {
+            // --resident-budget-gib auto: the RAM could not keep even one expert outside the GPU cache - the plain
+            // file tier, as with --mmap-experts alone
+            std::fprintf(stderr, "strata generate: WARNING: the RAM cannot keep any of the experts the GPU does not hold "
+                                 "(%s); every miss is read from the model files %s\n", err.c_str(),
+                         src.unbuffered() ? "with unbuffered I/O" : "through the OS file cache");
         } else if (o.resident_budget > 0) {
             // #403: a RAM budget that cannot be kept is not a reason to stop - the experts it would have held are
             // read from the files like the ones outside it (pin_cache_complement leaves nothing half-built)

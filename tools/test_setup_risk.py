@@ -290,6 +290,43 @@ class LowRamGpus(unittest.TestCase):
             self.assertNotIn("no layer split yet", out)
 
 
+class LowRamPartialCopy(unittest.TestCase):
+    """The RAM does not hold every expert the GPU does not hold: the copy keeps the hottest ones it has room for
+    (--resident-budget-gib auto) instead of none (--mmap-experts).  32 GB + one 24 GB card, IQ3_XXS at 128K: 26.2 GB
+    of experts outside the cache against the 31.9 - 10 = 21.9 GB the resident mode asks for."""
+
+    RAM32, FOUND32 = PROFILES["32GB-2x24GB"]
+    ONE = ["--family", "qwen", "--no-start", "--gpu", "0"]
+
+    def test_a_part_of_them_is_kept_when_the_engine_sizes_the_copy(self):
+        code, out, cfg, _ = install(self.RAM32, self.FOUND32, [*self.ONE, "--model", "IQ3_XXS"], version="0.1.53")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(arg(cfg, "--resident-budget-gib"), "auto")
+        self.assertNotIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("--resident-experts", cfg["args"])
+        self.assertIn("the hottest that fit this PC's", out)
+
+    def test_an_engine_from_before_it_reads_through_the_file_cache(self):
+        code, out, cfg, _ = install(self.RAM32, self.FOUND32, [*self.ONE, "--model", "IQ3_XXS"], version="0.1.52")
+        self.assertEqual(code, 0, out)
+        self.assertIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
+        self.assertIn("cannot size the RAM copy itself", out)
+
+    def test_the_whole_complement_keeps_the_resident_mode(self):
+        code, out, cfg, _ = install(self.RAM32, self.FOUND32, [*self.ONE, "--model", "Q2_0"], version="0.1.53")
+        self.assertEqual(code, 0, out)
+        self.assertIn("--resident-experts", cfg["args"])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
+
+    def test_asked_for_the_file_cache_keeps_it(self):
+        code, out, cfg, _ = install(self.RAM32, self.FOUND32, [*self.ONE, "--model", "IQ3_XXS", "--low-ram", "mmap"],
+                                    version="0.1.53")
+        self.assertEqual(code, 0, out)
+        self.assertIn("--mmap-experts", cfg["args"])
+        self.assertNotIn("--resident-budget-gib", cfg["args"])
+
+
 class StartOnSeveralGpus(unittest.TestCase):
     """A resident low-RAM config started on several GPUs reads the experts through the file cache (#364 #384)."""
 

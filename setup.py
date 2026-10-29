@@ -2040,7 +2040,8 @@ def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
     # #498: UD-Q4_K_XL's RAM budget had no layer split; without it the RAM must hold the GGUFs and 24 GB more.  #642:
     # the engines from RESIDENT_SPLIT_ENGINE keep the budget on both cards, so any RAM is offered them (one GPU stays
     # the recommendation, the tested setup)
-    budget = "--resident-budget-gib" in cfg.get("args", [])
+    budget = arg_after(cfg.get("args", []), "--resident-budget-gib")
+    budget = budget is not None and budget != "auto"   # ("auto" is the low-RAM mode's own copy, not an Unsloth budget)
     if budget and not resident_split() and ram_gb() < unsloth_split_need_gb(budget_model(cfg)):
         return cfg
     pair = can[:2]
@@ -5854,6 +5855,7 @@ DATA_ITEMS = ("models", "packs", "mtp")
 LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
 RESIDENT_ENGINE = (0, 1, 30)   # the first engine with --resident-experts (the low-RAM mode's resident variant)
 RESIDENT_SPLIT_ENGINE = (0, 1, 40)   # #642: the first engine that runs it on a layer split
+BUDGET_AUTO_ENGINE = (0, 1, 53)       # the first engine whose --resident-budget-gib takes `auto` (as much as the RAM holds)
 
 
 def resident_split() -> bool:
@@ -9252,7 +9254,7 @@ def main() -> int:
             elif low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}% "
                            "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu))
-                                                 else "the rest is read from the SSD as needed)"))
+                                                 else "the RAM keeps the hottest of the rest)"))
             if d.get("budget") and hip and d.get("nvidia_only"):   # #429: not run on AMD yet
                 verdict += " - NVIDIA only so far, untested on AMD"
             if hip and d.get("repo"):                  # the ready-made NVFP4 packs: no AMD kernels at all
@@ -9352,7 +9354,7 @@ def main() -> int:
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
-                   + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
+                   + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the RAM keeps the hottest of the rest)"))
         say(f"  {i}) {m:8s}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(installed or recommended_size(family, names, ram, low_ram_vram(gpu))) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
@@ -9509,12 +9511,17 @@ def main() -> int:
     if vision != "none" and MODELS[model].get("vision_untested"):
         warn(f"images with {model} are untested: users report them working, but we have not run this file with "
              "images (#967); tell us if the answers look wrong")
-    # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold (and, as far as RAM allows,
+    # The low-RAM mode's variants.  resident: the experts the GPU's cache does not hold (and, as far as RAM allows,
     # the ones the prompt path borrows cache room from) are copied from the pack's experts.bin into RAM once, so
     # nothing is read from the SSD while it answers (engine 0.1.30, --resident-experts; the engine falls back to mmap
-    # with a warning when they do not fit the RAM it finds free).  mmap: they are read through the OS file cache.
+    # with a warning when they do not fit the RAM it finds free).  partial: they do not all fit - the copy keeps the
+    # hottest ones the RAM really has room for at start and the rest is read from the files
+    # (--resident-budget-gib auto: the engine measures the number, setup's estimate is not the RAM free at start,
+    # #403).  none: every one of them is read through the OS file cache (--mmap-experts) - only when nothing fits, or
+    # the person asked for it.
     # The GPU's share: its VRAM less the dense weights and buffers, this context's KV cache and the image encoder's room.
     resident = False
+    keep = "none"
     if low_ram and not fam.get("ready"):               # NVFP4's packs: the RAM-budget mode instead (step 7)
         arena = MODELS[model]["arena_gb"]
         vram = low_ram_vram(gpu) - (VISION[vision]["reserve_mib"] / 1024 if vision != "none" else 0)
@@ -9529,10 +9536,18 @@ def main() -> int:
             # #642: the resident variant on a split, by the same rule as on one card - what no card holds fits the RAM
             resident = resident_split() and (a.low_ram == "resident" or
                                              (a.low_ram != "mmap" and ram >= rest + LOW_RAM_HEADROOM_GB))
-            if resident:
+            # the RAM budget has the layer split from RESIDENT_SPLIT_ENGINE too, so a newer engine keeps what fits
+            keep = "all" if resident else "none" if a.low_ram == "mmap" or not resident_split() else "part"
+            if keep == "all":
                 ok(f"low-RAM mode on {len(chosen)} GPUs: they hold ~{100 * share:.0f}% of {model}'s experts "
                    f"({arena:.0f} GB) and the other ~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy "
                    "in the model folder")
+            elif keep == "part":
+                ok(f"low-RAM mode on {len(chosen)} GPUs: they hold ~{100 * share:.0f}% of {model}'s experts "
+                   f"({arena:.0f} GB); of the other ~{rest:.0f} GB, the hottest that fit this PC's {ram:.0f} GB of RAM "
+                   "stay in it, and the rest is read from the model folder")
+                warn("the RAM is too small for every expert the GPUs do not hold: the part read from the SSD will be "
+                     "slow (a faster SSD and a smaller size help)")
             else:
                 ok(f"low-RAM mode on {len(chosen)} GPUs: {model}'s experts ({arena:.0f} GB) are read from the model "
                    f"folder through the OS file cache instead of a copy in RAM ({ram:.0f} GB); the GPUs hold "
@@ -9541,14 +9556,23 @@ def main() -> int:
                     warn("most of the experts are read from the SSD while it answers: expect it to be much slower "
                          "than with enough RAM (a faster SSD and a smaller size help)")
         elif resident:
+            keep = "all"
             ok(f"low-RAM mode: the GPU holds ~{100 * share:.0f}% of {model}'s experts ({arena:.0f} GB) and the other "
                f"~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy in the model folder")
         else:
-            ok(f"low-RAM mode: {model}'s experts ({arena:.0f} GB) are read from the model folder through the OS file "
-               f"cache instead of a copy in RAM ({ram:.0f} GB); the GPU holds ~{100 * share:.0f}% of them")
-            if share < 0.6:
-                warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
-                     "with enough RAM (a faster SSD and a smaller size help)")
+            keep = "none" if a.low_ram == "mmap" else "part"
+            if keep == "part":
+                ok(f"low-RAM mode: the GPU holds ~{100 * share:.0f}% of {model}'s experts ({arena:.0f} GB); of the "
+                   f"other ~{rest:.0f} GB, the hottest that fit this PC's {ram:.0f} GB of RAM stay in it, and the rest "
+                   "is read from the model folder")
+                warn("the RAM is too small for every expert the GPU does not hold: the part read from the SSD will be "
+                     "slow (a faster SSD and a smaller size help)")
+            else:
+                ok(f"low-RAM mode: {model}'s experts ({arena:.0f} GB) are read from the model folder through the OS file "
+                   f"cache instead of a copy in RAM ({ram:.0f} GB); the GPU holds ~{100 * share:.0f}% of them")
+                if share < 0.6:
+                    warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
+                         "with enough RAM (a faster SSD and a smaller size help)")
     # EXPERIMENTAL: the experimental-speed-projection control vector (data/experimental-speed-projection), off unless
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
@@ -9800,6 +9824,7 @@ def main() -> int:
         args += ["--kv", kv]
     if resident and a.low_ram != "resident" and engine_ver < RESIDENT_ENGINE:
         resident = False                               # an engine from before --resident-experts would refuse it
+        keep = "none"                                  # ... and before the auto budget too
         ok(f"low-RAM mode: engine {meta.get('version')} has no resident variant yet; the experts are read through "
            "the OS file cache (run setup again after the next engine update)")
     if low_ram and ready:
@@ -9812,7 +9837,20 @@ def main() -> int:
         ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
            "experts.bin on the SSD as needed")
     elif low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
-        args += ["--resident-experts" if resident else "--mmap-experts"]
+        # ... all of them when they fit (--resident-experts), the hottest as many as the RAM holds when they do not
+        # (--resident-budget-gib auto: the engine sizes the copy from the RAM free at start), the whole set through
+        # the OS file cache only when nothing fits or --low-ram mmap asked for it
+        if keep == "all":
+            args += ["--resident-experts"]
+        elif keep == "part" and engine_ver >= BUDGET_AUTO_ENGINE:
+            # the engine measures it: setup's estimate is not the RAM free at start (#403)
+            args += ["--resident-budget-gib", "auto"]
+        else:
+            args += ["--mmap-experts"]
+            if keep == "part":   # an engine from before the auto budget reads every expert through the file cache
+                ok(f"low-RAM mode: this engine ({meta.get('version')}) cannot size the RAM copy itself; the experts "
+                   "the GPU does not hold are read through the OS file cache (run setup again after the next engine "
+                   "update to keep as many of them in RAM as it holds)")
     elif is_gb10(gpu):
         # a DGX Spark: the RAM copy of the experts and the GPU's cache are the same memory. Mapped, every expert fits in the cache (NVFP4
         # on a 128 GB GB10: 24576 of 24576 slots, not 13702; chat decode 44.4 against 40.6 tok/s, 16K prompt 1471 against 1397)
