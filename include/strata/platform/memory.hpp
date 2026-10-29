@@ -70,11 +70,18 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
 /// a miss cheap enough that the cache's faults and read-ahead cost more than the hits save.  Hence an absolute floor: the
 /// direct path must run at 4 GB/s or more.  Then a cache that holds under 30% needs the direct path 1.3x faster; up to
 /// half, 1.5x.
+/// #3857: the floor is a cliff a PCIe 4 NVMe straddles, and the timing lands on either side run to run: an RTX 4060
+/// laptop with 30 GB of RAM, `--resident-budget-gib auto` (a 22 GiB copy, the cache holding 26-27% of the 11 GiB read
+/// set) timed the same drive at 4.72 GB/s (unbuffered, a 30K prompt prefill at 880.7 tok/s) and at 3.83 GB/s (cache
+/// stays, 257.5 tok/s) - 3.4x on prefill, by luck, at every start.  The drive is not slow there: the note above is
+/// 1.65-2.5 GB/s.  So under the floor a cache holding under a third goes to the direct reads when they are clearly
+/// ahead (2.5x) and the drive is still past 3 GB/s.
 inline bool file_tier_prefers_direct(double held_fraction, double direct_bps, double cached_bps) {
     if (!(direct_bps > 0.0) || !(cached_bps > 0.0)) return false;
-    if (held_fraction >= 0.5 || direct_bps < 4.0e9) return false;
+    if (held_fraction >= 0.5) return false;
     const double ratio = direct_bps / cached_bps;
-    return held_fraction < 0.3 ? ratio >= 1.3 : ratio >= 1.5;
+    if (direct_bps >= 4.0e9) return held_fraction < 0.3 ? ratio >= 1.3 : ratio >= 1.5;
+    return held_fraction < 0.3 && direct_bps >= 3.0e9 && ratio >= 2.5;
 }
 
 /// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with STRATA_READ_AHEAD=0.
