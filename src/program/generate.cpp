@@ -4215,6 +4215,28 @@ int main(int argc, char** argv) {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
+    } else {
+        // The share was GIVEN, so the probe above and PcieAuto's refinement do not run (the engine runs as asked).
+        // Both lanes read the same RAM, so a share that starves one of them is worth saying: on an RTX 4060 Laptop
+        // (x8 Gen4, 13.3 GB/s, Ryzen 7 7735H, IQ2_XS, 186-token prompt, 96 tokens) --pcie-frac 0.90 decoded at
+        // 27.5 tok/s and the engine's own 0.25 at 42.5 - the link alone carries 13.3 GB/s, the CPU pool alone
+        // reads its experts from RAM at 24.5 GB/s.  Nothing here changes a result; the line is advice.
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        const bool nvfp4_pack = native_pack && !lay0.fmt.empty() && lay0.fmt[0].gu_type == 40;
+        const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
+        const double base = strata::pcie_start_frac(nvfp4_pack, native_pack, pcie_share_gfx12_default(),
+                                                   pfd != nullptr && std::strcmp(pfd, "old") == 0,
+                                                   strata::qwen_defaults_026());
+        std::string bursts;
+        const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+        const double rule = bw > 0.0 ? pcie_frac_for_gbps(bw, base) : base;
+        if (bw > 0.0 && (o.pcie_frac > rule * 1.5 || o.pcie_frac < rule * 0.6))
+            std::fprintf(stderr, "strata generate: --pcie-frac %.2f fixes the missed experts' share, so neither the "
+                                 "probe nor the CPU pool's speed adjusts it.  This link probes %.1f GB/s host->device "
+                                 "(best of %s), where the engine's own rule starts at %.2f; the pool and the link "
+                                 "read the same RAM, so a share far from that leaves one of them idle.  Drop "
+                                 "--pcie-frac to let it tune.\n",
+                         o.pcie_frac, bw, bursts.c_str(), rule);
     }
     // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
     // instead of the probe's fixed share above - the CPU's speed sets the right share as much as the link's.  IQ2_XS,
