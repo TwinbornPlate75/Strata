@@ -4,6 +4,8 @@ Three settings depend on the machine more than on the model, and the defaults ar
 measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
   --pcie-frac     the share of the experts missing from VRAM that are copied over PCIe and run on the GPU instead of
                   on the CPU.  A fast PCIe link and a slow CPU want more; a laptop's x8 link or a fast CPU want less.
+                  Measured and reported, never written: the engine refines this share itself while it serves, and a
+                  written flag turns that off for good (see AUTO for the measurements behind this).
   --spec-min-p    how sure the draft layer must be to extend a verify window by another guess.  A slower CPU pays more
                   per extra window row (more experts per window), so it wants a higher floor.
   --pool-workers  the CPU threads that compute experts.  Every physical core is not always best: on hybrid CPUs the
@@ -24,9 +26,9 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   2x RX 6900 XT on Linux, 6-11% faster with it), so it is measured here, per PC, and written into the
                   config's "env" only when it wins.  The output is identical either way (same token ids).
 
-The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
-count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
-path streams every expert whatever they say.
+The draft floor and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the PCIe
+share is measured the same way; the worker count, the adaptive tier and the shared-expert stream need a restart per
+value.  Those are decode speed: the prompt path streams every expert whatever they say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
@@ -57,6 +59,18 @@ SH_STREAM = "STRATA_SH_STREAM"
 ADAPT_CANDIDATES = (None, ("1", "80", "0.97"), ("1", "160", "0.97"))
 ADAPT_FLAGS = ("--adapt-every", "--adapt-swaps", "--adapt-decay")
 MAX_NEW = 128
+# The protocol's version, recorded with what a run saved.  A record from an older one is not replayed into a new
+# config: 2 stopped writing --pcie-frac (a share chosen under 1 was picked out of noise, and a written one stops the
+# engine refining it - see AUTO).
+PROTOCOL_VERSION = 2
+# The engine's own PCIe share: no --pcie-frac, so it probes the link at start and refines the share from the CPU
+# pool's measured speed while it serves (PcieAuto).  A --pcie-frac given at start turns that refinement off for the
+# whole session, and this sweep cannot order the values, so nothing here writes one.  On an RTX 4060 Laptop (PCIe 4.0
+# x8, 13.3 GB/s, Ryzen 7 7735H) every value from 0.0 to 1.0 measured 14.9-16.4 tok/s - inside one another's noise,
+# with 0.75 "winning" one pass and 0.9 the next - while serving ran at 43 tok/s on the engine's own share and 29 on a
+# written 0.90.  The record this PC saved on 2026-10-11 carries that 0.90 (49.6 tok/s then, an engine that did not
+# refine the share itself); replayed into today's engine it costs 33% of the decode rate.
+AUTO = None
 # the expert tier follows a text over some windows: 128-token answers end before it shows (on a Xeon E5-2673 v3 with
 # DDR3, every 1 / 160 / 0.97 measured +0.7% with 128 tokens and +7.9% with 512-token answers), so its step uses these
 TIER_MAX_NEW = 512
@@ -192,6 +206,16 @@ def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     return best if med[best] > med[default_key] * (1.0 + min_gain) else default_key
 
 
+def best_of(measured: dict, prefer=None):
+    """A sweep's winner: the key with the best median, and `prefer` when it is level with it (a tie decides nothing,
+    and the value the config already runs with needs no confirmation round)."""
+    med = {k: statistics.median(v) for k, v in measured.items() if v}
+    if not med:
+        return prefer
+    best = max(med, key=med.get)
+    return prefer if prefer in med and med[prefer] == med[best] else best
+
+
 class Session:
     """One running engine: measure decode tok/s for a setting (the median of the prompts' rates)."""
 
@@ -280,6 +304,9 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say,
     hunted.  Rotating the values inside one engine start puts that drift on every value the same number of times,
     and the median over the rounds keeps a single bad sample from deciding.  The caller takes the winner from the
     medians, so every value keeps the same chance the others had.
+
+    A value of `None` is `AUTO`: the key is left out of the request, so the engine keeps its own setting (its own
+    PCIe share is refined while it serves).
     """
     out = {v: [] for v in values}
     if stage is not None:
@@ -291,13 +318,18 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say,
             completed += 1
             if stage is not None:
                 _progress(progress, stage, completed, len(values) * SWEEP_ROUNDS)
-        say(f"    round {r + 1}/{SWEEP_ROUNDS} {label}: " +
-            "  ".join(f"{v:g} {out[v][-1]:.1f}" for v in values))
+        say(f"    round {r + 1}/{SWEEP_ROUNDS} {label}: " + "  ".join(_value_label(v, out[v][-1]) for v in values))
     med = {v: statistics.median(out[v]) for v in values}
     say(f"    {label}, median of {SWEEP_ROUNDS}: " +
-        ", ".join(f"{v:g}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
-        f" -> best {max(med, key=lambda k: med[k]):g}")
+        ", ".join(f"{_value_label(v, med[v])} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
+        f" -> best {_value_label(max(med, key=lambda k: med[k]))}")
     return out
+
+
+def _value_label(v, rate: float | None = None) -> str:
+    """A sweep value as the log says it: `auto` for the engine's own setting, else the number, optionally with its rate."""
+    name = "auto" if v is None else f"{v:g}"
+    return name if rate is None else f"{name} {rate:.1f}"
 
 
 def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, hip: bool = False,
@@ -327,44 +359,54 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             say("  Measuring the prompt chunks of the layer split ...")
             pipe, rep_pipe = measure_pipe(eng, long_prompt, say)
             report.update(rep_pipe)
-        # 1. the PCIe share, at the default draft floor
-        by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}), {"spec_min_p": d_minp}, "pcie_frac",
+        # 1. the PCIe share, at the default draft floor.  Measured, not chosen: a fixed share turns the engine's own
+        # refinement off for good, and this sweep cannot order the values (see AUTO) - so the report shows where
+        # they landed and what a fixed one would have done, and the engine keeps the choice.
+        by_pcie = sweep(s, [AUTO, *sorted(set(PCIE_FRACS) | {round(d_pcie, 2)})], {"spec_min_p": d_minp}, "pcie_frac",
                         "PCIe share", say, progress, "pcie_share")
-        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
-        # 2. the draft floor, at that share
-        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), {"pcie_frac": best_pcie}, "spec_min_p",
+        best_pcie = best_of(by_pcie, AUTO)          # a tie goes to the engine's own share
+        # 2. the draft floor, at the share the config will run with: the engine's own
+        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), {"pcie_frac": AUTO}, "spec_min_p",
                         "draft floor", say, progress, "draft_floor")
-        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
-        # 3. the winner against the default, interleaved, the same number of rounds
-        dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
-        confirm = {dflt: [], cand: []}
-        confirm_total = SWEEP_ROUNDS * 2 if cand != dflt else 1
-        _progress(progress, "confirmation", 0, confirm_total)
-        if cand != dflt:
-            for _ in range(SWEEP_ROUNDS):
-                for k in (dflt, cand):
-                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
-                    _progress(progress, "confirmation", sum(map(len, confirm.values())), confirm_total)
-        else:
-            _progress(progress, "confirmation", 1, 1)
-        chosen = pick(confirm, dflt) if cand != dflt else dflt
-        report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
-                      pcie_sweep={str(k): v for k, v in by_pcie.items()},
+        best_minp = best_of(by_minp, round(d_minp, 2))
+        # 3. the floor's winner against the default, interleaved, the same number of rounds; a fixed share rides along
+        # (reported, never written) so the log says what leaving it to the engine costs or saves
+        dflt, cand = (AUTO, round(d_minp, 2)), (AUTO, best_minp)
+        fixed = (best_pcie, d_minp)
+        keys = [dflt] if cand == dflt else [dflt, cand]
+        if best_pcie != AUTO:
+            keys.append(fixed)
+        confirm = {k: [] for k in keys}
+        _progress(progress, "confirmation", 0, len(keys) * SWEEP_ROUNDS if len(keys) > 1 else 1)
+        for _ in range(SWEEP_ROUNDS if len(keys) > 1 else 1):
+            for k in keys:
+                confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+                _progress(progress, "confirmation", sum(map(len, confirm.values())),
+                          len(keys) * SWEEP_ROUNDS if len(keys) > 1 else 1)
+        chosen = pick({k: confirm[k] for k in keys if k[0] == AUTO}, dflt)
+        report.update(default={"pcie_frac": _value_label(dflt[0]), "spec_min_p": dflt[1], "pool_workers": d_workers},
+                      pcie_sweep={_value_label(k): v for k, v in by_pcie.items()},
                       min_p_sweep={str(k): v for k, v in by_minp.items()},
-                      confirm={f"{k[0]}/{k[1]}": v for k, v in confirm.items()})
+                      confirm={f"{_value_label(k[0])}/{k[1]}": v for k, v in confirm.items()})
+        if best_pcie != AUTO and confirm.get(fixed) and confirm[dflt]:
+            gain = statistics.median(confirm[fixed]) / statistics.median(confirm[dflt]) - 1.0
+            report["pcie_fixed_gain"] = round(gain, 4)
+            say(f"    a fixed share of {best_pcie:g} measured {gain * 100:+.1f}% against the engine's own"
+                " (not written: the sweep cannot order these values, and a fixed one stops the engine adjusting)")
     finally:
         close(eng)
     settings = {}
     if pipe:
         settings["--prefill-pipe"] = str(int(pipe))
-    if chosen != dflt:
-        settings["--pcie-frac"] = f"{chosen[0]:.2f}"
+    # --pcie-frac is never written (see 1. and AUTO): apply() drops one an older run left behind, which is what puts
+    # the engine back in charge of the share
+    if chosen[1] != dflt[1]:
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
     # 4. fewer CPU workers (a restart each), with the chosen settings.  #1337's rule covers a death during a
     # measurement too: an engine that exits mid-rate is that candidate losing; the measurements so far stay.
     if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
-        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
+        tuned = apply(base_args, settings)
         by_workers = {}
         workers = worker_candidates(d_workers, extra_workers)
         _progress(progress, "cpu_workers", 0, len(workers))

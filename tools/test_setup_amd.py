@@ -547,7 +547,8 @@ class CalibrationKey(unittest.TestCase):
         store = {"calibration": {setup.hardware_key(cfg): saved, setup.hardware_key(self.cfg(0)): other}}
         with mock.patch.object(setup, "load_settings", lambda: store):
             with mock.patch.object(setup, "WIN", False):
-                self.assertEqual(setup.setup_calibration(cfg, hip=True), saved)       # its own card's, not the XTX's
+                # its own card's, not the XTX's; a record from the older protocol is stamped with the current one
+                self.assertEqual(setup.setup_calibration(cfg, hip=True), {**saved, "protocol": 2})
                 self.assertIsNone(setup.setup_calibration(self.cfg(2), hip=True))     # never tuned on that card
             with mock.patch.object(setup, "WIN", True):
                 self.assertIsNone(setup.setup_calibration(cfg, hip=True))             # Windows HIP: defaults for now

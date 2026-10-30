@@ -6882,7 +6882,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     st = load_settings()
     st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"], "env": res.get("env") or {},
                                                            "tok_s": res["report"].get("tok_s"),
-                                                           "date": time.strftime("%Y-%m-%d")}
+                                                           "date": time.strftime("%Y-%m-%d"),
+                                                           "protocol": CAL.PROTOCOL_VERSION}
     save_settings(st)
     chosen = {**res["settings"], **(res.get("env") or {})}
     if chosen:
@@ -6895,8 +6896,27 @@ def calibrate_config(cfg_path: Path) -> bool:
 
 
 def saved_calibration(cfg: dict) -> dict | None:
-    """The settings an earlier calibration found for this PC and model, if any."""
-    return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+    """The settings an earlier calibration found for this PC and model, if any.
+
+    A record from an older calibration protocol keeps everything but its --pcie-frac: under protocol 1 the share was
+    chosen from values that sat inside each other's noise, and a written share turns the engine's own refinement off
+    for good (a written 0.90 measured 29 tok/s where the engine's own share ran at 43 on an RTX 4060 Laptop).  The
+    engine picks that share itself now, so a reinstall leaves the key to it."""
+    rec = (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+    if not rec:
+        return rec
+    try:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import calibrate as CAL
+        protocol = CAL.PROTOCOL_VERSION
+    except Exception:                                  # no tuning module here (the Terminal archive): as recorded
+        return rec
+    if rec.get("protocol") == protocol:
+        return rec
+    settings = dict(rec.get("settings") or {})
+    if settings.pop("--pcie-frac", None) is not None:
+        warn("the PCIe share an earlier tuning wrote is dropped: the engine adjusts it itself while serving")
+    return {**rec, "settings": settings, "protocol": protocol}
 
 
 def setup_calibration(cfg: dict, hip: bool) -> dict | None:

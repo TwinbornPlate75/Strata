@@ -45,7 +45,10 @@ class FakeEngine:
             raise RuntimeError("the engine exited: ERR verify: the adaptive tier's copies for layer 47 never landed"
                                " (the copy stream itself is not drained); restart the engine")
         tune = sampling.get("strata_tune") or {}
-        rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
+        # a key left out of the request is the engine's own setting: its reported share (0.55 here), as on a real one
+        share = tune.get("pcie_frac")
+        rate = self.speed(0.55 if share is None else share, tune.get("spec_min_p", self.info["spec_min_p"]),
+                          self.workers)
         rate *= self.adapt_bonus
         for _ in range(max_new):
             yield 1
@@ -147,7 +150,7 @@ class Calibrate(unittest.TestCase):
                         lambda args: FakeEngine(args, lambda *_: 50.0),
                         say=lambda *_: None, progress=progress, cancel_event=stopped)
         self.assertIn(("loading", 1, 1), events)
-        self.assertIn(("pcie_share", 1, len(CAL.PCIE_FRACS) * CAL.SWEEP_ROUNDS), events)
+        self.assertIn(("pcie_share", 1, (len(set(CAL.PCIE_FRACS) | {0.55}) + 1) * CAL.SWEEP_ROUNDS), events)   # + auto
         self.assertNotIn("draft_floor", [stage for stage, _, _ in events])
 
     def test_active_generation_receives_shared_cancel_event(self):
@@ -185,13 +188,31 @@ class Calibrate(unittest.TestCase):
         res, _ = self.run_with(lambda f, p, w: 51.0 if abs(f - 0.35) < 1e-6 else 50.0)
         self.assertEqual(res["settings"], {})
 
-    def test_finds_pcie_and_min_p(self):
+    def test_finds_the_draft_floor_and_never_writes_the_share(self):
+        # the share is measured and reported, never written: a written one stops the engine adjusting it, and this
+        # sweep cannot order the values (see CAL.AUTO)
         def speed(f, p, w):
             return 50.0 + (10.0 if abs(f - 0.2) < 1e-6 else 0.0) + (5.0 if abs(p - 0.7) < 1e-6 else 0.0)
         res, _ = self.run_with(speed)
-        self.assertEqual(res["settings"].get("--pcie-frac"), "0.20")
+        self.assertNotIn("--pcie-frac", res["settings"])
         self.assertEqual(res["settings"].get("--spec-min-p"), "0.70")
         self.assertNotIn("--pool-workers", res["settings"])
+        self.assertAlmostEqual(res["report"]["pcie_fixed_gain"], 0.2)      # 0.20 at 60 over the engine's 50
+
+    def test_a_share_inside_the_noise_is_not_written(self):
+        # #PCIe: the engine's own share (no flag) is a candidate, and a written one turns its refinement off, so a
+        # fixed value inside the noise must not be written: 0.2 is 2% faster here, below MIN_GAIN
+        res, _ = self.run_with(lambda f, p, w: 51.0 if abs(f - 0.2) < 1e-6 else 50.0)
+        self.assertNotIn("--pcie-frac", res["settings"])
+        self.assertEqual(res["report"]["default"]["pcie_frac"], "auto")
+        self.assertIn("auto", res["report"]["pcie_sweep"])
+
+    def test_the_engines_own_share_wins_a_flat_sweep(self):
+        # every value the same: the sweep's winner is the engine's own share, so nothing is written and the
+        # confirmation has nothing to compare
+        res, _ = self.run_with(lambda f, p, w: 50.0)
+        self.assertEqual(res["settings"], {})
+        self.assertEqual(list(res["report"]["confirm"]), ["auto/0.5"])
 
     def test_fewer_workers(self):
         # a hybrid CPU: half the workers is 20% faster
@@ -212,7 +233,8 @@ class Calibrate(unittest.TestCase):
             return FakeEngine(args, lambda f, p, w: 80.0 if f == 0.75 else 50.0, 6)
         said = []
         res = CAL.measure(BASE, [[1, 2, 3]] * 3, start, say=said.append)
-        self.assertEqual(res["settings"].get("--pcie-frac"), "0.75")        # steps 1-3 survived
+        self.assertNotIn("--pcie-frac", res["settings"])                     # steps 1-3 survived, the share is not written
+        self.assertAlmostEqual(res["report"]["pcie_fixed_gain"], 0.6)        # 80 against the engine's 50, in the report
         self.assertGreater(len(res["report"]["failed_starts"]), 1)
         self.assertTrue(any("did not start" in x and "cudaMalloc" in x for x in said))
         self.assertEqual(res["report"]["workers"], {})
@@ -430,6 +452,20 @@ class SetupIntegration(unittest.TestCase):
         # another context size is another key (its KV cache changes the expert cache)
         other = dict(written, args=CAL.with_arg(written["args"], "--max-context", "131072"))
         self.assertIsNone(self.S.saved_calibration(other))
+
+    def test_a_calibration_from_an_older_protocol_keeps_its_share_out(self):
+        # protocol 1 wrote --pcie-frac from a sweep whose values sat inside each other's noise, and a written share
+        # turns the engine's own refinement off, so a reinstall must not re-apply it (the rest of the record stands)
+        cfg = {"exe": "x", "args": list(BASE), "model_name": "qwen3.8-flash-next-q2_0"}
+        path = self.S.settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        old = {"settings": {"--pcie-frac": "0.90", "--spec-min-p": "0.70"}, "date": "2026-10-20"}
+        path.write_text(json.dumps({"calibration": {self.S.hardware_key(cfg): old}}))
+        self.assertEqual(self.S.saved_calibration(cfg)["settings"], {"--spec-min-p": "0.70"})
+        # this protocol's record is replayed as it is
+        new = {"settings": {"--pcie-frac": "0.20"}, "protocol": CAL.PROTOCOL_VERSION}
+        path.write_text(json.dumps({"calibration": {self.S.hardware_key(cfg): new}}))
+        self.assertEqual(self.S.saved_calibration(cfg)["settings"], {"--pcie-frac": "0.20"})
 
     def test_calibrate_config_writes_the_env_choice(self):
         # HIP: the measured engine variable goes into the config's "env" and the settings file; a re-run that finds it

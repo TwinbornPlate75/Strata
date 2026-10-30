@@ -141,7 +141,7 @@ Some engine settings depend on the PC more than on the model:
 
 | Setting | What it controls |
 | --- | --- |
-| `--pcie-frac` | Share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU. A fast PCIe link and a slow CPU want more; a laptop's narrow link wants less. |
+| `--pcie-frac` | Share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU. A fast PCIe link and a slow CPU want more; a laptop's narrow link wants less. Measured for the report, never written: the engine starts from the link's measured speed and adjusts the share while it serves, and a written value stops that. |
 | `--spec-min-p` | How sure the draft layer must be to add another guess to a check. |
 | `--pool-workers` | How many CPU threads compute experts. On CPUs with efficiency cores, fewer can be faster. |
 | `--adapt-every`, `--adapt-swaps`, `--adapt-decay` | How busily the VRAM expert cache follows the conversation. A CPU that reads missed experts slowly (DDR3 or DDR4 in few channels) gains from more swaps. |
@@ -151,6 +151,11 @@ The defaults were measured on a Ryzen 5 7600 with an RTX 5070. From a source che
 measures output speed with each setting on your PC and keeps one only when it is more than 3% faster. The result is
 remembered per PC and model, and updates keep it. Measuring the worker count restarts the model more than once, so the PC
 is busy and can stop responding for a minute or two at each restart.
+
+The PCIe share is measured but never written. The values are inside each other's noise over a short answer (on an RTX
+4060 Laptop: 14.9-16.4 tok/s from 0.0 to 1.0, with a different one "fastest" each run), while the engine's own share
+ran at 43 tok/s in serving and a written 0.90 at 29. A written value also stops the engine adjusting the share, so a
+calibration cannot talk itself out of a bad pick afterwards.
 
 ### Running it at startup (Task Scheduler)
 

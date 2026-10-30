@@ -30,7 +30,10 @@ from strata_control import atomic as _atomic_mod
 from strata_control import posix_owner
 
 
-SUITE = "legacy-decode-v1"
+# The measurement protocol a report was taken under.  v2: tools/calibrate.py no longer writes --pcie-frac (a share
+# picked under v1 came out of values inside each other's noise, and writing one stops the engine refining it while it
+# serves).  A v1 report is refused rather than replayed into today's engine.
+SUITE = "legacy-decode-v2"
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 MAX_APPLICATION_BYTES = 8 * 1024
 MAX_AGE_SECONDS = 30 * 24 * 3600
@@ -443,7 +446,8 @@ def _settings_candidate(hardware_key: str, result: dict) -> tuple[Path, bytes | 
     if not isinstance(cal, dict):
         raise ProfileError("setup calibration store is invalid; config unchanged", 5)
     cal[hardware_key] = {"settings": result["settings"], "tok_s": result["measurements"].get("tok_s"),
-                         "date": time.strftime("%Y-%m-%d")}
+                         "date": time.strftime("%Y-%m-%d"),
+                         "protocol": _full_folder("tools.calibrate").PROTOCOL_VERSION}
     try:
         proposed = (json.dumps(settings, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
     except (TypeError, ValueError):
