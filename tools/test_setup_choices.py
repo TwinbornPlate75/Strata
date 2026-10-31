@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -728,3 +729,52 @@ class CalibrateWithModel(unittest.TestCase):
             self.assertEqual(setup.calibration_targets(ps, "Q2_0", None), [ps[1]])
             self.assertEqual(setup.calibration_targets(ps, "Q2_0", "qwen"), [ps[1]])
             self.assertEqual(setup.calibration_targets(ps, "Q4_K_M", None), [])
+
+
+class TuningChoice(unittest.TestCase):
+    """Step 8 of the wizard: what an install does with the tuning.  A record this PC saved earlier used to be applied
+    without a word, so an install answered by a person had no way to measure again; now it is offered with its
+    numbers, and --yes/--no-start (a run that answers no questions) still take it as it is."""
+
+    RECORD = {"settings": {"--spec-min-p": "0.70"}, "env": {}, "tok_s": 42.8, "date": "2026-10-31", "protocol": 2}
+
+    def choose(self, answers=(), cal="record", **kw):
+        a = types.SimpleNamespace(yes=kw.get("yes", False), no_start=kw.get("no_start", False))
+        asked = []
+        pending = list(answers)
+
+        def fake_input(prompt=""):
+            asked.append(prompt)
+            return pending.pop(0) if pending else ""
+
+        with mock.patch("builtins.input", fake_input):
+            got, out = quiet(setup.tuning_choice, None if cal == "none" else self.RECORD, a, kw.get("hip", False))
+        return got, out, asked
+
+    def test_a_record_is_offered_and_used_by_default(self):
+        got, out, asked = self.choose(answers=("\n",))
+        self.assertEqual(got, (self.RECORD, False))
+        self.assertIn("tuned on 2026-10-31: 42.8 tokens/s", out)
+        self.assertIn("--spec-min-p 0.70", out)
+        self.assertIn("Which one?", asked[0])
+        self.assertIn("2) measure them again now", out)
+
+    def test_measuring_again_drops_the_record_and_runs_the_tuning(self):
+        got, _, _ = self.choose(answers=("2\n",))
+        self.assertEqual(got, (None, True))
+
+    def test_starting_from_what_setup_writes_drops_it_without_measuring(self):
+        got, _, _ = self.choose(answers=("3\n",))
+        self.assertEqual(got, (None, False))
+
+    def test_no_record_asks_whether_to_measure(self):
+        self.assertEqual(self.choose(answers=("\n",), cal="none")[0], (None, True))       # Enter: yes, as before
+        self.assertEqual(self.choose(answers=("n\n",), cal="none")[0], (None, False))
+
+    def test_a_run_that_answers_no_questions_keeps_the_record(self):
+        for kw in ({"yes": True}, {"no_start": True}, {"hip": True}):
+            with self.subTest(kw):
+                got, out, asked = self.choose(**kw)
+                self.assertEqual(got, (self.RECORD, False))
+                self.assertEqual(asked, [])
+                self.assertNotIn("Step 8", out)

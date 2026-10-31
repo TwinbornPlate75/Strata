@@ -6929,6 +6929,33 @@ def setup_calibration(cfg: dict, hip: bool) -> dict | None:
     return saved_calibration(cfg)
 
 
+def tuning_choice(cal: dict | None, a, hip: bool) -> tuple[dict | None, bool]:
+    """What this install does with the tuning: the record it applies (None: none) and whether to measure now.
+
+    Step 8 of the wizard.  A record this PC saved earlier is shown with its numbers and used unless the answer says
+    otherwise - it used to be applied without a word, so an install answered by a person had no way to measure again.
+    --yes and --no-start keep the record as it is, and so does an adopted earlier install (it sets --yes), so a run
+    that answers no questions installs what the same command installed before.  AMD keeps it too: the tuning is
+    offered on NVIDIA only (each control is verified on HIP first)."""
+    if a.yes or a.no_start or hip:
+        return cal, False
+    step(8, "the settings for this PC")
+    if cal is not None:
+        say(f"  This PC and this model were tuned on {cal.get('date') or 'an earlier run'}"
+            + (f": {cal['tok_s']} tokens/s" if cal.get("tok_s") else ":"))
+        for k, v in {**(cal.get("settings") or {}), **(cal.get("env") or {})}.items():
+            say(f"    {k} {v}" if k.startswith("--") else f"    {k}={v}")
+        say("  1) use them")
+        say("  2) measure them again now (about 15-30 minutes, longer on a slow card; the PC is busy meanwhile)")
+        say("  3) start from what setup writes instead (the measurement is kept for a later install)")
+        pick = ask("Which one?", ["1", "2", "3"], "1", a.yes)
+        return (cal, False) if pick == "1" else (None, pick == "2")
+    say("  A few engine settings that depend on this PC (the CPU threads, the expert cache, the draft depth) are")
+    say("  measured here instead of keeping the defaults: about 15-30 minutes, longer on a slow card; the PC is")
+    say("  busy meanwhile. It can be done later too: " + ("START-HERE.bat" if WIN else "./setup.sh") + " --calibrate")
+    return None, ask("Tune Strata for this PC now?", ["y", "n"], "y", a.yes) == "y"
+
+
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 8192, as the free VRAM allows - about 2x faster on long prompts).  Under WSL,
@@ -10228,6 +10255,7 @@ def main() -> int:
         cfg["images"] = setup_images(a, gpu, hip, Path(a.models_dir))
     cfg_path = home() / f"strata-{tag.lower()}.json"
     cal = setup_calibration(cfg, hip)                  # #566: Linux HIP too; the tuning is offered on NVIDIA only
+    cal, tune_now = tuning_choice(cal, a, hip)
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
         import calibrate as CAL
@@ -10245,13 +10273,7 @@ def main() -> int:
         say("  " + line)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
-    # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
-    if cal is None and not hip and not a.no_start and not a.yes and ask(
-            "Tune Strata for this PC now? It measures a few engine settings (about 15-30 minutes, longer on a slow card; the PC is busy "
-            "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
-        tuned = calibrate_config(cfg_path)
-    else:
-        tuned = None                                   # not asked for: nothing to repeat below
+    tuned = calibrate_config(cfg_path) if tune_now else None   # nothing asked for: nothing to repeat below
     ok(f"start script: {script.name}")
 
     say()

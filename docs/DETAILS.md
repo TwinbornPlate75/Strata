@@ -148,7 +148,10 @@ Some engine settings depend on the PC more than on the model:
 | `--prefill-pipe` | On two or more cards (layer split), the prompt chunks that keep the cards reading at once. See [MULTI_GPU.md](MULTI_GPU.md). |
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. From a source checkout, `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`)
-measures output speed with each setting on your PC and keeps one only when it is more than 3% faster. The result is
+measures output speed with each setting on your PC and keeps one only when it is more than 3% faster. Setup asks the
+same question while it runs (`=== Step 8: the settings for this PC ===`): a tuning it remembers for this PC and model
+is shown with its numbers and used unless you answer otherwise, and it is measured now when none is remembered. A run
+that answers no questions (`--yes`, `--no-start`, a pipe) takes such a record as it is. The result is
 remembered per PC and model, and updates keep it. Measuring the worker count restarts the model more than once, so the PC
 is busy and can stop responding for a minute or two at each restart.
 
